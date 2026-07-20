@@ -204,6 +204,44 @@ def load_models(args):
     rmvpe = RMVPE(model_path, is_half=False, device=device)
     f0_fn = rmvpe.infer_from_audio
 
+    # Optional modern pitch extractor: FCPE (F0-Cross-Entropy-PreTrain).
+    # FCPE is ~10x faster than RMVPE and notably more robust on breathy and
+    # high-pitched vocals (the exact regimes that hurt SVC). It is opt-in:
+    # if the `fcpe` package or weights are missing we fall back to RMVPE and
+    # never crash. Enable with `pip install fcpe`.
+    fcpe_fn = None
+    try:
+        import fcpe  # noqa: F401
+        fcpe_path = load_custom_model_from_hf("lj1995/VoiceConversionWebUI", "fcpe.pt", None)
+        fcpe_model = fcpe.FCPE(fcpe_path, device=device, dtype=torch.float32, use_amp=False)
+        fcpe_model.eval()
+
+        def fcpe_f0(audio, thred=0.03):
+            try:
+                wav = audio
+                if not torch.is_tensor(wav):
+                    wav = torch.from_numpy(wav)
+                wav = wav.float().to(device)
+                if wav.dim() == 1:
+                    wav = wav.unsqueeze(0)
+                with torch.no_grad():
+                    f0, _uv = fcpe_model.infer(
+                        wav, sample_rate=16000, threshold=thred,
+                        use_viterbi=True, use_tqdm=False,
+                    )
+                f0 = f0.squeeze().cpu().numpy()
+                if f0.ndim > 1:
+                    f0 = f0[0]
+                return f0
+            except Exception:
+                # Any FCPE runtime problem -> fall back to RMVPE for safety.
+                return f0_fn(audio, thred=thred)
+
+        fcpe_fn = fcpe_f0
+        print("[INFO] FCPE pitch extractor loaded; use 'Use FCPE pitch' to enable it.")
+    except Exception as e:
+        print(f"[INFO] FCPE not available ({e}); falling back to RMVPE for pitch extraction.")
+
     return (
         model,
         semantic_fn,
@@ -212,6 +250,7 @@ def load_models(args):
         to_mel,
         mel_fn_args,
         f0_fn,
+        fcpe_fn,
     )
 
 def adjust_f0_semitones(f0_sequence, n_semitones):
@@ -224,8 +263,9 @@ def crossfade(chunk1, chunk2, overlap):
     chunk2[:overlap] = chunk2[:overlap] * fade_in + chunk1[-overlap:] * fade_out
     return chunk2
 
-def postprocess_wave(wave, sr):
-    """Full post-processing. Applies 30 Hz high-pass (filtfilt) + soft limiter.
+def postprocess_wave(wave, sr, use_presence_eq=False, presence_gain_db=3.0):
+    """Full post-processing. Applies 30 Hz high-pass (filtfilt) + optional
+    presence high-shelf + soft limiter.
     Must be run ONCE on the concatenated full wave, never per chunk, because
     filtfilt assumes edge-padded boundaries and would inject transients at
     every chunk seam."""
@@ -234,6 +274,8 @@ def postprocess_wave(wave, sr):
     if sr > 60:
         b, a = sp_sig.butter(2, 30.0, btype='high', fs=sr)
         wave = sp_sig.filtfilt(b, a, wave)
+    if use_presence_eq and sr > 0:
+        wave = _high_shelf(wave, sr, fc=3500.0, gain_db=presence_gain_db)
     threshold = 0.99
     over = np.abs(wave) > threshold
     wave[over] = np.sign(wave[over]) * (threshold + (np.abs(wave[over]) - threshold) / (1.0 + (np.abs(wave[over]) - threshold)))
@@ -268,6 +310,159 @@ def soft_limit_chunk(wave):
     wave[over] = np.sign(wave[over]) * (threshold + (np.abs(wave[over]) - threshold) / (1.0 + (np.abs(wave[over]) - threshold)))
     return wave.astype(np.float32)
 
+
+def smooth_f0_vibrato(f0_tensor, fps, cutoff=12.0):
+    """Vibrato-preserving F0 smoothing.
+
+    The original pipeline used a median filter plus a Savitzky-Golay filter
+    whose window reached ~360 ms. At typical singing vibrato rates (5-7 Hz,
+    period ~150-200 ms) that window *attenuates the vibrato itself*, flattening
+    the natural pitch modulation that makes singing sound human.
+
+    This replacement removes only frame-to-frame *jitter* (extractor noise,
+    glitchy octaves) while preserving the slower musical content:
+      1. a tiny median filter (3 taps) kills isolated spike outliers,
+      2. a 2nd-order Butterworth low-pass at `cutoff` Hz is applied in the
+         LOG-F0 domain over each contiguous voiced segment. The cutoff sits
+         well above vibrato (5-7 Hz) but below jitter (>15-20 Hz), so natural
+         pitch contour and vibrato survive while the staircase/robotic jitter
+         is removed. Unvoiced frames stay untouched.
+    """
+    f0 = f0_tensor[0]
+    voiced = f0 > 1
+    if not bool(voiced.any()):
+        return f0_tensor
+    try:
+        from scipy.signal import medfilt, butter, filtfilt
+    except Exception:
+        return f0_tensor
+    log_f0 = torch.log(f0 + 1e-5)
+    log_np = log_f0.cpu().numpy()
+    voiced_np = voiced.cpu().numpy()
+    # 1) spike-outlier removal on voiced values only
+    vals = log_np[voiced_np]
+    if len(vals) > 3:
+        vals = medfilt(vals, kernel_size=3)
+        log_np[voiced_np] = vals
+    # 2) low-pass each contiguous voiced run (keeps vibrato, kills jitter)
+    nyq = 0.5 * fps
+    cutoff_n = min(cutoff / nyq, 0.49)
+    if cutoff_n <= 0:
+        return f0_tensor
+    b, a = butter(2, cutoff_n, btype='low')
+    idx = np.where(voiced_np)[0]
+    if idx.size:
+        boundaries = np.where(np.diff(idx) > 1)[0] + 1
+        for run in np.split(idx, boundaries):
+            if run.size < 12:  # filtfilt needs enough samples; leave short runs as-is
+                continue
+            log_np[run] = filtfilt(b, a, log_np[run])
+    out = torch.exp(torch.from_numpy(log_np).to(f0_tensor.device)) - 1e-5
+    out = torch.clamp(out, min=0.0)
+    result = f0_tensor.clone()
+    result[0] = out
+    return result
+
+
+def octave_guard_f0(f0_tensor, max_ratio=2.0):
+    """Fix implausible frame-to-frame pitch jumps by shifting the offending
+    frame by whole octaves relative to the previous voiced frame.
+
+    Consecutive voiced F0 frames are ~10 ms apart, so a jump of a full octave
+    (2x) in a single step is physically impossible for singing; such jumps are
+    extractor glitches (RMVPE octave errors). Only *octave* shifts are applied,
+    which preserves the perceived note, so this cannot invent a wrong pitch."""
+    f0 = f0_tensor[0].detach().cpu().numpy().astype(np.float64).copy()
+    voiced = f0 > 1.0
+    idx = np.where(voiced)[0]
+    prev = None
+    for i in idx:
+        v = f0[i]
+        if prev is not None and prev > 1.0:
+            while v > max_ratio * prev:
+                v = v / 2.0
+            while v < prev / max_ratio:
+                v = v * 2.0
+        f0[i] = v
+        prev = v
+    out = torch.from_numpy(f0.astype(np.float32)).to(f0_tensor.device)
+    res = f0_tensor.clone()
+    res[0] = out
+    return res
+
+
+def pitch_snap(f0_tensor, snap_cents=50.0, fps=100.0, ref_hz=440.0):
+    """Snap the *tonal center* of voiced pitch to the nearest equal-tempered
+    semitone (in-tune correction) while preserving the per-frame deviation, so
+    natural vibrato and expressive portamento survive.
+
+    Only frames whose smoothed center sits within `snap_cents` of a semitone are
+    corrected, so intentionally detuned / microtonal singing is left untouched.
+    This is the modern "autotune done right" approach: quantize the *center*,
+    keep the *expression*."""
+    from scipy.signal import butter, filtfilt
+    f0 = f0_tensor[0]
+    voiced = f0 > 1.0
+    if not bool(voiced.any()):
+        return f0_tensor
+    f0_np = f0.detach().cpu().numpy().astype(np.float64)
+    voiced_np = voiced.detach().cpu().numpy()
+    # tonal center: strong low-pass of the voiced log-F0 (well below vibrato,
+    # so it captures the mean pitch, not the vibrato itself)
+    nyq = 0.5 * fps
+    cutoff_n = min(5.0 / nyq, 0.49)
+    if cutoff_n <= 0:
+        return f0_tensor
+    b, a = butter(2, cutoff_n, btype='low')
+    log_f0 = np.where(voiced_np, np.log(f0_np + 1e-5), 0.0)
+    idx = np.where(voiced_np)[0]
+    if idx.size:
+        boundaries = np.where(np.diff(idx) > 1)[0] + 1
+        for run in np.split(idx, boundaries):
+            if run.size < 8:
+                continue
+            log_f0[run] = filtfilt(b, a, log_f0[run])
+    center = np.exp(log_f0) - 1e-5
+    center = np.clip(center, 0.0, None)
+    vc = center > 1.0
+    if not bool(vc.any()):
+        return f0_tensor
+    cents = 1200.0 * np.log2(center[vc] / ref_hz)
+    nearest = np.round(cents / 100.0) * 100.0
+    dev = np.abs(cents - nearest)
+    snapped = ref_hz * 2.0 ** (nearest / 1200.0)
+    final_center = np.where(dev <= snap_cents, snapped, center[vc])
+    # preserve per-frame vibrato / portamento deviation around the (snapped) center
+    dev_ratio = np.ones_like(f0_np)
+    dev_ratio[vc] = f0_np[vc] / np.where(center[vc] > 1.0, center[vc], 1.0)
+    new_f0 = f0_np.copy()
+    new_f0[vc] = final_center * dev_ratio[vc]
+    out = torch.from_numpy(new_f0.astype(np.float32)).to(f0_tensor.device)
+    res = f0_tensor.clone()
+    res[0] = out
+    return res
+
+
+def _high_shelf(wave, sr, fc=3500.0, gain_db=3.0):
+    """First-order RBJ high-shelf filter used to restore presence / air that the
+    BigVGAN vocoder slightly attenuates in the upper treble. Implemented as a
+    zero-phase (filtfilt) biquad so it adds no phase distortion."""
+    import scipy.signal as sp_sig
+    A = 10.0 ** (gain_db / 40.0)
+    w0 = 2.0 * np.pi * fc / sr
+    cos_w0 = np.cos(w0)
+    sqrtA = np.sqrt(A)
+    alpha = np.sin(w0) / 2.0 * np.sqrt(2.0)  # RBJ shelf with S = 1
+    b0 = A * ((A + 1.0) + (A - 1.0) * cos_w0 + 2.0 * sqrtA * alpha)
+    b1 = -2.0 * A * ((A - 1.0) + (A + 1.0) * cos_w0)
+    b2 = A * ((A + 1.0) + (A - 1.0) * cos_w0 - 2.0 * sqrtA * alpha)
+    a0 = (A + 1.0) - (A - 1.0) * cos_w0 + 2.0 * sqrtA * alpha
+    a1 = 2.0 * ((A - 1.0) - (A + 1.0) * cos_w0)
+    a2 = (A + 1.0) - (A - 1.0) * cos_w0 - 2.0 * sqrtA * alpha
+    b = np.array([b0, b1, b2], dtype=np.float64) / a0
+    a = np.array([a0, a1, a2], dtype=np.float64) / a0
+    return sp_sig.filtfilt(b, a, wave).astype(np.float32)
+
 # streaming and chunk processing related params
 # max_context_window = sr // hop_length * 30
 # overlap_frame_len = 16
@@ -276,6 +471,7 @@ bitrate = "320k"
 
 model_f0, semantic_fn, vocoder_fn, campplus_model, to_mel_f0, mel_fn_args = None, None, None, None, None, None
 f0_fn = None
+fcpe_fn_global = None
 overlap_wave_len = None
 max_context_window = None
 sr = None
@@ -284,7 +480,7 @@ overlap_frame_len = 16
 
 @torch.no_grad()
 @torch.inference_mode()
-def voice_conversion(source, target, diffusion_steps, length_adjust, inference_cfg_rate, auto_f0_adjust, pitch_shift, sway_sampling_coef=0.0, use_rk2=False, use_f0_smoothing=True, use_f0_clamp=True, use_log_linear_f0=True, use_segment_avg_embed=True, use_post_process=True, use_loudness_norm=True):
+def voice_conversion(source, target, diffusion_steps, length_adjust, inference_cfg_rate, auto_f0_adjust, pitch_shift, sway_sampling_coef=0.0, use_rk2=False, use_rk4=False, use_rk45=False, cfg_rescale=0.0, use_f0_clamp=True, use_f0_smoothing=True, use_log_linear_f0=True, use_segment_avg_embed=True, use_post_process=True, use_loudness_norm=True, use_fcpe=False, use_octave_guard=True, use_pitch_snap=False, pitch_snap_cents=50.0, use_presence_eq=False, presence_gain=3.0, sample_noise=1.0, ensemble_n=1):
     inference_module = model_f0
     mel_fn = to_mel_f0
     # Load audio
@@ -373,8 +569,9 @@ def voice_conversion(source, target, diffusion_steps, length_adjust, inference_c
         feat2 = feat2 - feat2.mean(dim=0, keepdim=True)
         style2 = campplus_model(feat2.unsqueeze(0))
 
-    F0_ori = f0_fn(ref_waves_16k[0], thred=0.03)
-    F0_alt = f0_fn(converted_waves_16k[0], thred=0.03)
+    active_f0_fn = fcpe_fn_global if (use_fcpe and fcpe_fn_global is not None) else f0_fn
+    F0_ori = active_f0_fn(ref_waves_16k[0], thred=0.03)
+    F0_alt = active_f0_fn(converted_waves_16k[0], thred=0.03)
 
     if device.type == "mps":
         F0_ori = torch.from_numpy(F0_ori).float().to(device)[None]
@@ -389,6 +586,10 @@ def voice_conversion(source, target, diffusion_steps, length_adjust, inference_c
         alt_voiced = F0_alt > 1
         F0_ori[ori_voiced] = torch.clamp(F0_ori[ori_voiced], min=fmin, max=fmax)
         F0_alt[alt_voiced] = torch.clamp(F0_alt[alt_voiced], min=fmin, max=fmax)
+
+    if use_octave_guard:
+        F0_ori = octave_guard_f0(F0_ori)
+        F0_alt = octave_guard_f0(F0_alt)
 
     voiced_F0_ori = F0_ori[F0_ori > 1]
     voiced_F0_alt = F0_alt[F0_alt > 1]
@@ -407,21 +608,10 @@ def voice_conversion(source, target, diffusion_steps, length_adjust, inference_c
         shifted_f0_alt[F0_alt > 1] = adjust_f0_semitones(shifted_f0_alt[F0_alt > 1], pitch_shift)
 
     if use_f0_smoothing:
-        voiced_mask = (F0_alt > 1)[0].cpu().numpy()
-        if voiced_mask.any():
-            from scipy.signal import medfilt
-            shifted_f0_alt_np = shifted_f0_alt[0].detach().cpu().numpy().copy()
-            voiced_vals = shifted_f0_alt_np[voiced_mask]
-            smoothed = medfilt(voiced_vals, kernel_size=min(5, len(voiced_vals)))
-            try:
-                from scipy.signal import savgol_filter
-                wl = min(31, len(voiced_vals) // 2 * 2 - 1)
-                if wl >= 5:
-                    smoothed = savgol_filter(smoothed, window_length=wl, polyorder=2)
-            except Exception:
-                pass
-            shifted_f0_alt_np[voiced_mask] = smoothed
-            shifted_f0_alt[0] = torch.from_numpy(shifted_f0_alt_np).to(shifted_f0_alt.device)
+        fps = sr / hop_length
+        shifted_f0_alt = smooth_f0_vibrato(shifted_f0_alt, fps, cutoff=12.0)
+        if use_pitch_snap:
+            shifted_f0_alt = pitch_snap(shifted_f0_alt, snap_cents=pitch_snap_cents, fps=fps)
 
     # Length regulation
     cond, _, codes, commitment_loss, codebook_loss = inference_module.length_regulator(S_alt, ylens=target_lengths, n_quantizers=3, f0=shifted_f0_alt)
@@ -466,12 +656,27 @@ def voice_conversion(source, target, diffusion_steps, length_adjust, inference_c
         is_last_chunk = processed_frames + max_source_window >= cond.size(1)
         cat_condition = torch.cat([prompt_condition, chunk_cond], dim=1)
         with torch.autocast(device_type=device.type, dtype=torch.float32):
-            vc_target = inference_module.cfm.inference(cat_condition,
-                                                        torch.LongTensor([cat_condition.size(1)]).to(mel2.device),
-                                                        mel2, style2, None, diffusion_steps,
-                                                        inference_cfg_rate=inference_cfg_rate,
-                                                        sway_sampling_coef=sway_sampling_coef,
-                                                        ode_method="midpoint" if use_rk2 else "euler")
+            ode_method = "rk45" if use_rk45 else "rk4" if use_rk4 else "midpoint" if use_rk2 else "euler"
+
+            def _run_cfm():
+                return inference_module.cfm.inference(cat_condition,
+                                                      torch.LongTensor([cat_condition.size(1)]).to(mel2.device),
+                                                      mel2, style2, None, diffusion_steps,
+                                                      inference_cfg_rate=inference_cfg_rate,
+                                                      sway_sampling_coef=sway_sampling_coef,
+                                                      ode_method=ode_method,
+                                                      cfg_rescale=cfg_rescale,
+                                                      temperature=sample_noise)
+
+            # Stochastic ensemble: average several CFM trajectories from
+            # different noise seeds. Reduces residual stochastic artifacts /
+            # "hushed" detail loss for a cleaner, more stable result
+            # (costs ensemble_n x the CFM evaluation).
+            if ensemble_n and ensemble_n > 1:
+                outs = [_run_cfm() for _ in range(int(ensemble_n))]
+                vc_target = torch.stack(outs, dim=0).mean(dim=0)
+            else:
+                vc_target = _run_cfm()
             vc_target = vc_target[:, :, mel2.size(-1):]
         vc_wave = vocoder_fn(vc_target.float()).squeeze().cpu()
         if vc_wave.ndim == 1:
@@ -488,7 +693,7 @@ def voice_conversion(source, target, diffusion_steps, length_adjust, inference_c
                 ).export(format="mp3", bitrate=bitrate).read()
                 full_wave = np.concatenate(generated_wave_chunks).astype(np.float32)
                 if use_post_process:
-                    full_wave = postprocess_wave(full_wave, sr)
+                    full_wave = postprocess_wave(full_wave, sr, use_presence_eq=use_presence_eq, presence_gain_db=presence_gain)
                 if use_loudness_norm:
                     full_wave = loudness_normalize(full_wave, sr)
                 elif not use_post_process:
@@ -519,7 +724,7 @@ def voice_conversion(source, target, diffusion_steps, length_adjust, inference_c
             ).export(format="mp3", bitrate=bitrate).read()
             full_wave = np.concatenate(generated_wave_chunks).astype(np.float32)
             if use_post_process:
-                full_wave = postprocess_wave(full_wave, sr)
+                full_wave = postprocess_wave(full_wave, sr, use_presence_eq=use_presence_eq, presence_gain_db=presence_gain)
             if use_loudness_norm:
                 full_wave = loudness_normalize(full_wave, sr)
             elif not use_post_process:
@@ -542,9 +747,9 @@ def voice_conversion(source, target, diffusion_steps, length_adjust, inference_c
 
 
 def main(args):
-    global model_f0, semantic_fn, vocoder_fn, campplus_model, to_mel_f0, mel_fn_args, f0_fn
+    global model_f0, semantic_fn, vocoder_fn, campplus_model, to_mel_f0, mel_fn_args, f0_fn, fcpe_fn_global
     global overlap_wave_len, max_context_window, sr, hop_length
-    model_f0, semantic_fn, vocoder_fn, campplus_model, to_mel_f0, mel_fn_args, f0_fn = load_models(args)
+    model_f0, semantic_fn, vocoder_fn, campplus_model, to_mel_f0, mel_fn_args, f0_fn, fcpe_fn_global = load_models(args)
     # streaming and chunk processing related params
     max_context_window = sr // hop_length * 30
     overlap_wave_len = overlap_frame_len * hop_length
@@ -565,20 +770,36 @@ def main(args):
         gr.Slider(label='Pitch shift / 音调变换', minimum=-24, maximum=24, step=1, value=0, info="Pitch shift in semitones, only works when F0 conditioned model is used / 半音数的音高变换，仅在勾选 '启用F0输入' 时生效"),
         gr.Slider(label='Sway sampling / 时间重映射', minimum=0.0, maximum=1.0, step=0.05, value=0.0, info="0 = prior behavior. ~0.9 sharpens timbre similarity / 0=原始行为，约0.9增强目标音色相似度"),
         gr.Checkbox(label="High-quality RK2 sampler / 高精度采样", value=False, info="2nd-order ODE solver, cleaner at low steps, ~2x slower per step"),
+        gr.Checkbox(label="RK4 sampler / 四阶采样", value=False, info="4th-order Runge-Kutta ODE solver, cleaner mel at equal step count, ~4x slower per step"),
+        gr.Checkbox(label="Adaptive RK45 sampler / 自适应采样", value=False, info="Adaptive embedded RKF45(4)5; best quality for a step budget, ignores sway sampling. Highest cost."),
+        gr.Slider(label='CFG rescale / 引导重缩放', minimum=0.0, maximum=1.0, step=0.05, value=0.0, info="0 = prior. >0 pulls CFG back to conditional distribution, reduces metallic over-saturation at high CFG rate"),
         gr.Checkbox(label="F0 range clamp / F0范围限制", value=True, info="Clamp F0 to 50-1100 Hz to avoid octave errors"),
-        gr.Checkbox(label="F0 smoothing / F0平滑", value=True, info="Median + Savitzky-Golay filter on voiced pitch contour"),
+        gr.Checkbox(label="F0 smoothing / F0平滑", value=True, info="Vibrato-preserving log-F0 low-pass (removes jitter, keeps vibrato)"),
         gr.Checkbox(label="Log-linear F0 / 对数线性F0", value=True, info="Linear log-F0 upsampling instead of nearest-neighbor"),
         gr.Checkbox(label="Segment-averaged embedding / 分段平均嵌入", value=True, info="Average speaker embedding over overlapping 5s windows"),
         gr.Checkbox(label="Post-process / 后处理", value=True, info="30 Hz high-pass + soft limiter on full output wave"),
         gr.Checkbox(label="LUFS normalization / 响度归一化", value=True, info="Normalize perceived loudness to -23 LUFS"),
+        gr.Checkbox(label="Use FCPE pitch / 使用FCPE音高", value=True, info="Modern pitch extractor (fast, robust on breathy/high vocals). Falls back to RMVPE if fcpe is not installed (pip install fcpe)"),
+        gr.Checkbox(label="Octave-jump guard / 八度跳变修正", value=True, info="Corrects impossible >1-octave frame jumps (extractor glitches) by octave shifts"),
+        gr.Checkbox(label="Pitch snap / 音准校正(自动调音)", value=False, info="Snap tonal center to nearest semitone (in-tune) while preserving vibrato. For a clean 'produced' sound"),
+        gr.Slider(label='Pitch snap tolerance / 校正容差', minimum=0, maximum=100, step=5, value=50, info="Only snap if the center pitch is within this many cents of a semitone"),
+        gr.Checkbox(label="Presence EQ / 临场感均衡", value=False, info="Gentle high-shelf to restore air lost in the vocoder (counters dullness)"),
+        gr.Slider(label='Presence gain / 临场增益(dB)', minimum=0.0, maximum=9.0, step=0.5, value=3.0, info="High-shelf boost above ~3.5 kHz"),
+        gr.Slider(label='Sample noise / 采样噪声', minimum=0.5, maximum=1.5, step=0.05, value=1.0, info="Diffusion initial-noise temperature. >1 adds air/detail, <1 smoother (1.0 = prior behavior)"),
+        gr.Slider(label='Ensemble runs / 集成次数', minimum=1, maximum=5, step=1, value=1, info="Average N stochastic runs to reduce artifacts (Nx slower, more stable)"),
     ]
 
-    examples = [["examples/source/yae_0.wav", "examples/reference/dingzhen_0.wav", 25, 1.0, 0.7, True, 0, 0.0, False, True, True, True, True, True, True],
-                ["examples/source/jay_0.wav", "examples/reference/azuma_0.wav", 25, 1.0, 0.7, True, 0, 0.0, False, True, True, True, True, True, True],
+    # Default example option values (after the 18 core settings):
+    #   use_fcpe, use_octave_guard, use_pitch_snap, pitch_snap_cents,
+    #   use_presence_eq, presence_gain, sample_noise, ensemble_n
+    _ex_opt = [True, True, False, 50, False, 3.0, 1.0, 1]
+
+    examples = [["examples/source/yae_0.wav", "examples/reference/dingzhen_0.wav", 25, 1.0, 0.7, True, 0, 0.0, False, False, False, 0.0, True, True, True, True, True, True] + _ex_opt,
+                ["examples/source/jay_0.wav", "examples/reference/azuma_0.wav", 25, 1.0, 0.7, True, 0, 0.0, False, False, False, 0.0, True, True, True, True, True, True] + _ex_opt,
                 ["examples/source/Wiz Khalifa,Charlie Puth - See You Again [vocals]_[cut_28sec].wav",
-                 "examples/reference/teio_0.wav", 50, 1.0, 0.7, False, 0, 0.0, False, True, True, True, True, True, True],
+                 "examples/reference/teio_0.wav", 50, 1.0, 0.7, False, 0, 0.0, False, False, False, 0.0, True, True, True, True, True, True] + _ex_opt,
                 ["examples/source/TECHNOPOLIS - 2085 [vocals]_[cut_14sec].wav",
-                 "examples/reference/trump_0.wav", 50, 1.0, 0.7, False, -12, 0.0, False, True, True, True, True, True, True],
+                 "examples/reference/trump_0.wav", 50, 1.0, 0.7, False, -12, 0.0, False, False, False, 0.0, True, True, True, True, True, True] + _ex_opt,
                 ]
 
     outputs = [gr.Audio(label="Stream Output Audio / 流式输出", streaming=True, format='mp3'),
