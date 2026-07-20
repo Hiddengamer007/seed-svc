@@ -132,11 +132,11 @@ class SeedVCWrapper:
         self.campplus_model.to(self.device)
         
         # Load BigVGAN models
-        self.bigvgan_model = bigvgan.BigVGAN.from_pretrained('nvidia/bigvgan_v2_22khz_80band_256x', use_cuda_kernel=False)
+        self.bigvgan_model = bigvgan.BigVGAN.from_pretrained('nvidia/bigvgan_v2_22khz_80band_256x', use_cuda_kernel=torch.cuda.is_available())
         self.bigvgan_model.remove_weight_norm()
         self.bigvgan_model = self.bigvgan_model.eval().to(self.device)
         
-        self.bigvgan_44k_model = bigvgan.BigVGAN.from_pretrained('nvidia/bigvgan_v2_44khz_128band_512x', use_cuda_kernel=False)
+        self.bigvgan_44k_model = bigvgan.BigVGAN.from_pretrained('nvidia/bigvgan_v2_44khz_128band_512x', use_cuda_kernel=torch.cuda.is_available())
         self.bigvgan_44k_model.remove_weight_norm()
         self.bigvgan_44k_model = self.bigvgan_44k_model.eval().to(self.device)
         
@@ -304,7 +304,9 @@ class SeedVCWrapper:
                 if traversed_time == 0:
                     features_list.append(chunk_features)
                 else:
-                    features_list.append(chunk_features[:, 50 * overlapping_time:])
+                    feat_rate = chunk_features.size(1) / (chunk.size(-1) / 16000.0)
+                    overlap_frames = int(round(overlapping_time * feat_rate))
+                    features_list.append(chunk_features[:, overlap_frames:])
                 buffer = chunk[:, -16000 * overlapping_time:]
                 traversed_time += 30 * 16000 if traversed_time == 0 else chunk.size(-1) - 16000 * overlapping_time
             features = torch.cat(features_list, dim=1)
@@ -405,6 +407,22 @@ class SeedVCWrapper:
             shifted_f0_alt = torch.exp(shifted_log_f0_alt)
             if pitch_shift != 0:
                 shifted_f0_alt[F0_alt > 1] = self.adjust_f0_semitones(shifted_f0_alt[F0_alt > 1], pitch_shift)
+
+            voiced_mask = (F0_alt > 1)[0].cpu().numpy()
+            if voiced_mask.any():
+                from scipy.signal import medfilt
+                shifted_f0_alt_np = shifted_f0_alt[0].detach().cpu().numpy().copy()
+                voiced_vals = shifted_f0_alt_np[voiced_mask]
+                smoothed = medfilt(voiced_vals, kernel_size=min(5, len(voiced_vals)))
+                try:
+                    from scipy.signal import savgol_filter
+                    wl = min(31, len(voiced_vals) // 2 * 2 - 1)
+                    if wl >= 5:
+                        smoothed = savgol_filter(smoothed, window_length=wl, polyorder=2)
+                except Exception:
+                    pass
+                shifted_f0_alt_np[voiced_mask] = smoothed
+                shifted_f0_alt[0] = torch.from_numpy(shifted_f0_alt_np).to(shifted_f0_alt.device)
         else:
             F0_ori = None
             F0_alt = None
@@ -430,8 +448,7 @@ class SeedVCWrapper:
             is_last_chunk = processed_frames + max_source_window >= cond.size(1)
             cat_condition = torch.cat([prompt_condition, chunk_cond], dim=1)
             
-            with torch.autocast(device_type=self.device.type, dtype=torch.float16):
-                # Voice Conversion
+            with torch.autocast(device_type=self.device.type, dtype=torch.float32):
                 vc_target = inference_module.cfm.inference(
                     cat_condition,
                     torch.LongTensor([cat_condition.size(1)]).to(mel2.device),

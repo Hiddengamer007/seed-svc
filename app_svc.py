@@ -65,7 +65,8 @@ def load_models(args):
     if vocoder_type == 'bigvgan':
         from modules.bigvgan import bigvgan
         bigvgan_name = model_params.vocoder.name
-        bigvgan_model = bigvgan.BigVGAN.from_pretrained(bigvgan_name, use_cuda_kernel=False)
+        use_cuda = torch.cuda.is_available()
+        bigvgan_model = bigvgan.BigVGAN.from_pretrained(bigvgan_name, use_cuda_kernel=use_cuda)
         # remove weight norm in the model and set to eval mode
         bigvgan_model.remove_weight_norm()
         bigvgan_model = bigvgan_model.eval().to(device)
@@ -223,6 +224,50 @@ def crossfade(chunk1, chunk2, overlap):
     chunk2[:overlap] = chunk2[:overlap] * fade_in + chunk1[-overlap:] * fade_out
     return chunk2
 
+def postprocess_wave(wave, sr):
+    """Full post-processing. Applies 30 Hz high-pass (filtfilt) + soft limiter.
+    Must be run ONCE on the concatenated full wave, never per chunk, because
+    filtfilt assumes edge-padded boundaries and would inject transients at
+    every chunk seam."""
+    import scipy.signal as sp_sig
+    wave = np.asarray(wave, dtype=np.float32)
+    if sr > 60:
+        b, a = sp_sig.butter(2, 30.0, btype='high', fs=sr)
+        wave = sp_sig.filtfilt(b, a, wave)
+    threshold = 0.99
+    over = np.abs(wave) > threshold
+    wave[over] = np.sign(wave[over]) * (threshold + (np.abs(wave[over]) - threshold) / (1.0 + (np.abs(wave[over]) - threshold)))
+    return wave.astype(np.float32)
+
+
+def loudness_normalize(wave, sr, target_lufs=-23.0):
+    wave = np.asarray(wave, dtype=np.float32)
+    try:
+        import pyloudnorm as pyln
+        if sr > 0 and len(wave) > sr // 4:
+            meter = pyln.Meter(sr)
+            measured = meter.integrated_loudness(wave)
+            if np.isfinite(measured):
+                gain = 10.0 ** ((target_lufs - measured) / 20.0)
+                wave = wave * gain
+    except Exception:
+        pass
+    peak = np.max(np.abs(wave)) + 1e-8
+    if peak > 0.99:
+        wave = wave / peak * 0.99
+    return wave.astype(np.float32)
+
+
+def soft_limit_chunk(wave):
+    """Per-chunk safe limiter (no filtfilt, so no seam transients). Used only
+    for the streamed MP3 preview; the final delivered WAV gets the full
+    postprocess_wave() pass."""
+    wave = np.asarray(wave, dtype=np.float32)
+    threshold = 0.99
+    over = np.abs(wave) > threshold
+    wave[over] = np.sign(wave[over]) * (threshold + (np.abs(wave[over]) - threshold) / (1.0 + (np.abs(wave[over]) - threshold)))
+    return wave.astype(np.float32)
+
 # streaming and chunk processing related params
 # max_context_window = sr // hop_length * 30
 # overlap_frame_len = 16
@@ -239,7 +284,7 @@ overlap_frame_len = 16
 
 @torch.no_grad()
 @torch.inference_mode()
-def voice_conversion(source, target, diffusion_steps, length_adjust, inference_cfg_rate, auto_f0_adjust, pitch_shift):
+def voice_conversion(source, target, diffusion_steps, length_adjust, inference_cfg_rate, auto_f0_adjust, pitch_shift, sway_sampling_coef=0.0, use_rk2=False, use_f0_smoothing=True, use_f0_clamp=True, use_log_linear_f0=True, use_segment_avg_embed=True, use_post_process=True, use_loudness_norm=True):
     inference_module = model_f0
     mel_fn = to_mel_f0
     # Load audio
@@ -270,7 +315,9 @@ def voice_conversion(source, target, diffusion_steps, length_adjust, inference_c
             if traversed_time == 0:
                 S_alt_list.append(S_alt)
             else:
-                S_alt_list.append(S_alt[:, 50 * overlapping_time:])
+                feat_rate = S_alt.size(1) / (chunk.size(-1) / 16000.0)
+                overlap_frames = int(round(overlapping_time * feat_rate))
+                S_alt_list.append(S_alt[:, overlap_frames:])
             buffer = chunk[:, -16000 * overlapping_time:]
             traversed_time += 30 * 16000 if traversed_time == 0 else chunk.size(-1) - 16000 * overlapping_time
         S_alt = torch.cat(S_alt_list, dim=1)
@@ -284,12 +331,47 @@ def voice_conversion(source, target, diffusion_steps, length_adjust, inference_c
     target_lengths = torch.LongTensor([int(mel.size(2) * length_adjust)]).to(mel.device)
     target2_lengths = torch.LongTensor([mel2.size(2)]).to(mel2.device)
 
-    feat2 = torchaudio.compliance.kaldi.fbank(ref_waves_16k,
-                                              num_mel_bins=80,
-                                              dither=0,
-                                              sample_frequency=16000)
-    feat2 = feat2 - feat2.mean(dim=0, keepdim=True)
-    style2 = campplus_model(feat2.unsqueeze(0))
+    if use_segment_avg_embed:
+        win_len = 5 * 16000
+        hop_len = 3 * 16000
+        min_len = 8000
+        ref_len = ref_waves_16k.size(-1)
+        if ref_len < win_len:
+            feat2 = torchaudio.compliance.kaldi.fbank(ref_waves_16k,
+                                                      num_mel_bins=80,
+                                                      dither=0,
+                                                      sample_frequency=16000)
+            feat2 = feat2 - feat2.mean(dim=0, keepdim=True)
+            style2 = campplus_model(feat2.unsqueeze(0))
+        else:
+            style_embeds = []
+            start = 0
+            while start + min_len <= ref_len:
+                end = min(start + win_len, ref_len)
+                seg = ref_waves_16k[0, start:end].unsqueeze(0)
+                f = torchaudio.compliance.kaldi.fbank(seg,
+                                                      num_mel_bins=80,
+                                                      dither=0,
+                                                      sample_frequency=16000)
+                f = f - f.mean(dim=0, keepdim=True)
+                style_embeds.append(campplus_model(f.unsqueeze(0)))
+                start += hop_len
+            if len(style_embeds) == 0:
+                feat2 = torchaudio.compliance.kaldi.fbank(ref_waves_16k,
+                                                          num_mel_bins=80,
+                                                          dither=0,
+                                                          sample_frequency=16000)
+                feat2 = feat2 - feat2.mean(dim=0, keepdim=True)
+                style2 = campplus_model(feat2.unsqueeze(0))
+            else:
+                style2 = torch.stack(style_embeds, dim=0).mean(dim=0)
+    else:
+        feat2 = torchaudio.compliance.kaldi.fbank(ref_waves_16k,
+                                                  num_mel_bins=80,
+                                                  dither=0,
+                                                  sample_frequency=16000)
+        feat2 = feat2 - feat2.mean(dim=0, keepdim=True)
+        style2 = campplus_model(feat2.unsqueeze(0))
 
     F0_ori = f0_fn(ref_waves_16k[0], thred=0.03)
     F0_alt = f0_fn(converted_waves_16k[0], thred=0.03)
@@ -301,6 +383,13 @@ def voice_conversion(source, target, diffusion_steps, length_adjust, inference_c
         F0_ori = torch.from_numpy(F0_ori).to(device)[None]
         F0_alt = torch.from_numpy(F0_alt).to(device)[None]
 
+    if use_f0_clamp:
+        fmin, fmax = 50.0, 1100.0
+        ori_voiced = F0_ori > 1
+        alt_voiced = F0_alt > 1
+        F0_ori[ori_voiced] = torch.clamp(F0_ori[ori_voiced], min=fmin, max=fmax)
+        F0_alt[alt_voiced] = torch.clamp(F0_alt[alt_voiced], min=fmin, max=fmax)
+
     voiced_F0_ori = F0_ori[F0_ori > 1]
     voiced_F0_alt = F0_alt[F0_alt > 1]
 
@@ -310,7 +399,6 @@ def voice_conversion(source, target, diffusion_steps, length_adjust, inference_c
     median_log_f0_ori = torch.median(voiced_log_f0_ori)
     median_log_f0_alt = torch.median(voiced_log_f0_alt)
 
-    # shift alt log f0 level to ori log f0 level
     shifted_log_f0_alt = log_f0_alt.clone()
     if auto_f0_adjust:
         shifted_log_f0_alt[F0_alt > 1] = log_f0_alt[F0_alt > 1] - median_log_f0_alt + median_log_f0_ori
@@ -318,11 +406,55 @@ def voice_conversion(source, target, diffusion_steps, length_adjust, inference_c
     if pitch_shift != 0:
         shifted_f0_alt[F0_alt > 1] = adjust_f0_semitones(shifted_f0_alt[F0_alt > 1], pitch_shift)
 
+    if use_f0_smoothing:
+        voiced_mask = (F0_alt > 1)[0].cpu().numpy()
+        if voiced_mask.any():
+            from scipy.signal import medfilt
+            shifted_f0_alt_np = shifted_f0_alt[0].detach().cpu().numpy().copy()
+            voiced_vals = shifted_f0_alt_np[voiced_mask]
+            smoothed = medfilt(voiced_vals, kernel_size=min(5, len(voiced_vals)))
+            try:
+                from scipy.signal import savgol_filter
+                wl = min(31, len(voiced_vals) // 2 * 2 - 1)
+                if wl >= 5:
+                    smoothed = savgol_filter(smoothed, window_length=wl, polyorder=2)
+            except Exception:
+                pass
+            shifted_f0_alt_np[voiced_mask] = smoothed
+            shifted_f0_alt[0] = torch.from_numpy(shifted_f0_alt_np).to(shifted_f0_alt.device)
+
     # Length regulation
     cond, _, codes, commitment_loss, codebook_loss = inference_module.length_regulator(S_alt, ylens=target_lengths, n_quantizers=3, f0=shifted_f0_alt)
     prompt_condition, _, codes, commitment_loss, codebook_loss = inference_module.length_regulator(S_ori, ylens=target2_lengths, n_quantizers=3, f0=F0_ori)
-    interpolated_shifted_f0_alt = torch.nn.functional.interpolate(shifted_f0_alt.unsqueeze(1), size=cond.size(1),
-                                                                  mode='nearest').squeeze(1)
+    if shifted_f0_alt.size(1) != cond.size(1):
+        if use_log_linear_f0:
+            src_len = shifted_f0_alt.size(1)
+            tgt_len = cond.size(1)
+            voiced_mask_src = (shifted_f0_alt[0] > 1)
+            log_f0 = torch.log(shifted_f0_alt[0] + 1e-5)
+            if voiced_mask_src.any():
+                voiced_idx = torch.nonzero(voiced_mask_src).flatten()
+                first_v, last_v = voiced_idx[0], voiced_idx[-1]
+                log_f0_filled = log_f0.clone()
+                log_f0_filled[:first_v] = log_f0[first_v]
+                log_f0_filled[last_v + 1:] = log_f0[last_v]
+                if voiced_idx.numel() > 1:
+                    for i in range(voiced_idx.numel() - 1):
+                        a, b = voiced_idx[i], voiced_idx[i + 1]
+                        if b - a > 1:
+                            log_f0_filled[a + 1:b] = (log_f0[a] + log_f0[b]) / 2.0
+            else:
+                log_f0_filled = log_f0
+            log_f0_filled = log_f0_filled.unsqueeze(0).unsqueeze(0).float()
+            vmask_float = voiced_mask_src.float().unsqueeze(0).unsqueeze(0)
+            interp_log = torch.nn.functional.interpolate(log_f0_filled, size=tgt_len, mode='linear', align_corners=True).squeeze(0).squeeze(0)
+            interp_mask = torch.nn.functional.interpolate(vmask_float, size=tgt_len, mode='linear', align_corners=True).squeeze(0).squeeze(0)
+            interp_f0 = torch.where(interp_mask >= 0.5, torch.exp(interp_log), torch.zeros_like(interp_log))
+            interpolated_shifted_f0_alt = interp_f0.unsqueeze(0).to(device=device, dtype=shifted_f0_alt.dtype)
+        else:
+            interpolated_shifted_f0_alt = torch.nn.functional.interpolate(shifted_f0_alt.unsqueeze(1), size=cond.size(1), mode='nearest').squeeze(1)
+    else:
+        interpolated_shifted_f0_alt = shifted_f0_alt
     max_source_window = max_context_window - mel2.size(2)
     # split source condition (cond) into chunks
     processed_frames = 0
@@ -333,12 +465,13 @@ def voice_conversion(source, target, diffusion_steps, length_adjust, inference_c
         chunk_f0 = interpolated_shifted_f0_alt[:, processed_frames:processed_frames + max_source_window]
         is_last_chunk = processed_frames + max_source_window >= cond.size(1)
         cat_condition = torch.cat([prompt_condition, chunk_cond], dim=1)
-        with torch.autocast(device_type=device.type, dtype=torch.float16 if fp16 else torch.float32):
-            # Voice Conversion
+        with torch.autocast(device_type=device.type, dtype=torch.float32):
             vc_target = inference_module.cfm.inference(cat_condition,
-                                                       torch.LongTensor([cat_condition.size(1)]).to(mel2.device),
-                                                       mel2, style2, None, diffusion_steps,
-                                                       inference_cfg_rate=inference_cfg_rate)
+                                                        torch.LongTensor([cat_condition.size(1)]).to(mel2.device),
+                                                        mel2, style2, None, diffusion_steps,
+                                                        inference_cfg_rate=inference_cfg_rate,
+                                                        sway_sampling_coef=sway_sampling_coef,
+                                                        ode_method="midpoint" if use_rk2 else "euler")
             vc_target = vc_target[:, :, mel2.size(-1):]
         vc_wave = vocoder_fn(vc_target.float()).squeeze().cpu()
         if vc_wave.ndim == 1:
@@ -346,15 +479,25 @@ def voice_conversion(source, target, diffusion_steps, length_adjust, inference_c
         if processed_frames == 0:
             if is_last_chunk:
                 output_wave = vc_wave[0].cpu().numpy()
+                output_wave = soft_limit_chunk(output_wave)
                 generated_wave_chunks.append(output_wave)
                 output_wave = (output_wave * 32768.0).astype(np.int16)
                 mp3_bytes = AudioSegment(
                     output_wave.tobytes(), frame_rate=sr,
                     sample_width=output_wave.dtype.itemsize, channels=1
                 ).export(format="mp3", bitrate=bitrate).read()
-                yield mp3_bytes, (sr, np.concatenate(generated_wave_chunks))
+                full_wave = np.concatenate(generated_wave_chunks).astype(np.float32)
+                if use_post_process:
+                    full_wave = postprocess_wave(full_wave, sr)
+                if use_loudness_norm:
+                    full_wave = loudness_normalize(full_wave, sr)
+                elif not use_post_process:
+                    peak = np.max(np.abs(full_wave)) + 1e-8
+                    full_wave = full_wave / peak * 0.95
+                yield mp3_bytes, (sr, full_wave)
                 break
             output_wave = vc_wave[0, :-overlap_wave_len].cpu().numpy()
+            output_wave = soft_limit_chunk(output_wave)
             generated_wave_chunks.append(output_wave)
             previous_chunk = vc_wave[0, -overlap_wave_len:]
             processed_frames += vc_target.size(2) - overlap_frame_len
@@ -366,6 +509,7 @@ def voice_conversion(source, target, diffusion_steps, length_adjust, inference_c
             yield mp3_bytes, None
         elif is_last_chunk:
             output_wave = crossfade(previous_chunk.cpu().numpy(), vc_wave[0].cpu().numpy(), overlap_wave_len)
+            output_wave = soft_limit_chunk(output_wave)
             generated_wave_chunks.append(output_wave)
             processed_frames += vc_target.size(2) - overlap_frame_len
             output_wave = (output_wave * 32768.0).astype(np.int16)
@@ -373,10 +517,19 @@ def voice_conversion(source, target, diffusion_steps, length_adjust, inference_c
                 output_wave.tobytes(), frame_rate=sr,
                 sample_width=output_wave.dtype.itemsize, channels=1
             ).export(format="mp3", bitrate=bitrate).read()
-            yield mp3_bytes, (sr, np.concatenate(generated_wave_chunks))
+            full_wave = np.concatenate(generated_wave_chunks).astype(np.float32)
+            if use_post_process:
+                full_wave = postprocess_wave(full_wave, sr)
+            if use_loudness_norm:
+                full_wave = loudness_normalize(full_wave, sr)
+            elif not use_post_process:
+                peak = np.max(np.abs(full_wave)) + 1e-8
+                full_wave = full_wave / peak * 0.95
+            yield mp3_bytes, (sr, full_wave)
             break
         else:
             output_wave = crossfade(previous_chunk.cpu().numpy(), vc_wave[0, :-overlap_wave_len].cpu().numpy(), overlap_wave_len)
+            output_wave = soft_limit_chunk(output_wave)
             generated_wave_chunks.append(output_wave)
             previous_chunk = vc_wave[0, -overlap_wave_len:]
             processed_frames += vc_target.size(2) - overlap_frame_len
@@ -403,20 +556,29 @@ def main(args):
     inputs = [
         gr.Audio(type="filepath", label="Source Audio / 源音频"),
         gr.Audio(type="filepath", label="Reference Audio / 参考音频"),
-        gr.Slider(minimum=1, maximum=200, value=10, step=1, label="Diffusion Steps / 扩散步数", info="10 by default, 50~100 for best quality / 默认为 10，50~100 为最佳质量"),
+        gr.Slider(minimum=1, maximum=200, value=30, step=1, label="Diffusion Steps / 扩散步数", info="30 by default, 50~100 for best quality / 默认为 30，50~100 为最佳质量"),
         gr.Slider(minimum=0.5, maximum=2.0, step=0.1, value=1.0, label="Length Adjust / 长度调整", info="<1.0 for speed-up speech, >1.0 for slow-down speech / <1.0 加速语速，>1.0 减慢语速"),
         gr.Slider(minimum=0.0, maximum=1.0, step=0.1, value=0.7, label="Inference CFG Rate", info="has subtle influence / 有微小影响"),
         gr.Checkbox(label="Auto F0 adjust / 自动F0调整", value=True,
                     info="Roughly adjust F0 to match target voice. Only works when F0 conditioned model is used. / 粗略调整 F0 以匹配目标音色，仅在勾选 '启用F0输入' 时生效"),
         gr.Slider(label='Pitch shift / 音调变换', minimum=-24, maximum=24, step=1, value=0, info="Pitch shift in semitones, only works when F0 conditioned model is used / 半音数的音高变换，仅在勾选 '启用F0输入' 时生效"),
+        gr.Slider(label='Sway sampling / 时间重映射', minimum=0.0, maximum=1.0, step=0.05, value=0.0, info="0 = prior behavior. ~0.9 sharpens timbre similarity / 0=原始行为，约0.9增强目标音色相似度"),
+        gr.Checkbox(label="High-quality RK2 sampler / 高精度采样", value=False, info="2nd-order ODE solver, cleaner at low steps, ~2x slower per step"),
+        gr.Checkbox(label="F0 range clamp / F0范围限制", value=True, info="Clamp F0 to 50-1100 Hz to avoid octave errors"),
+        gr.Checkbox(label="F0 smoothing / F0平滑", value=True, info="Median + Savitzky-Golay filter on voiced pitch contour"),
+        gr.Checkbox(label="Log-linear F0 / 对数线性F0", value=True, info="Linear log-F0 upsampling instead of nearest-neighbor"),
+        gr.Checkbox(label="Segment-averaged embedding / 分段平均嵌入", value=True, info="Average speaker embedding over overlapping 5s windows"),
+        gr.Checkbox(label="Post-process / 后处理", value=True, info="30 Hz high-pass + soft limiter on full output wave"),
+        gr.Checkbox(label="LUFS normalization / 响度归一化", value=True, info="Normalize perceived loudness to -23 LUFS"),
+        gr.Markdown("### Quality Enhancements / 质量增强"),
     ]
 
-    examples = [["examples/source/yae_0.wav", "examples/reference/dingzhen_0.wav", 25, 1.0, 0.7, True, 0],
-                ["examples/source/jay_0.wav", "examples/reference/azuma_0.wav", 25, 1.0, 0.7, True, 0],
+    examples = [["examples/source/yae_0.wav", "examples/reference/dingzhen_0.wav", 25, 1.0, 0.7, True, 0, 0.0, False, True, True, True, True, True, True],
+                ["examples/source/jay_0.wav", "examples/reference/azuma_0.wav", 25, 1.0, 0.7, True, 0, 0.0, False, True, True, True, True, True, True],
                 ["examples/source/Wiz Khalifa,Charlie Puth - See You Again [vocals]_[cut_28sec].wav",
-                 "examples/reference/teio_0.wav", 50, 1.0, 0.7, False, 0],
+                 "examples/reference/teio_0.wav", 50, 1.0, 0.7, False, 0, 0.0, False, True, True, True, True, True, True],
                 ["examples/source/TECHNOPOLIS - 2085 [vocals]_[cut_14sec].wav",
-                 "examples/reference/trump_0.wav", 50, 1.0, 0.7, False, -12],
+                 "examples/reference/trump_0.wav", 50, 1.0, 0.7, False, -12, 0.0, False, True, True, True, True, True, True],
                 ]
 
     outputs = [gr.Audio(label="Stream Output Audio / 流式输出", streaming=True, format='mp3'),

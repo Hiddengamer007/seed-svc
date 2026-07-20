@@ -63,7 +63,8 @@ def load_models(args):
     if vocoder_type == 'bigvgan':
         from modules.bigvgan import bigvgan
         bigvgan_name = model_params.vocoder.name
-        bigvgan_model = bigvgan.BigVGAN.from_pretrained(bigvgan_name, use_cuda_kernel=False)
+        use_cuda = torch.cuda.is_available()
+        bigvgan_model = bigvgan.BigVGAN.from_pretrained(bigvgan_name, use_cuda_kernel=use_cuda)
         # remove weight norm in the model and set to eval mode
         bigvgan_model.remove_weight_norm()
         bigvgan_model = bigvgan_model.eval().to(device)
@@ -219,7 +220,7 @@ hop_length = None
 overlap_frame_len = 16
 @torch.no_grad()
 @torch.inference_mode()
-def voice_conversion(source, target, diffusion_steps, length_adjust, inference_cfg_rate):
+def voice_conversion(source, target, diffusion_steps, length_adjust, inference_cfg_rate, sway_sampling_coef=0.0):
     inference_module = model
     mel_fn = to_mel
     # Load audio
@@ -250,7 +251,9 @@ def voice_conversion(source, target, diffusion_steps, length_adjust, inference_c
             if traversed_time == 0:
                 S_alt_list.append(S_alt)
             else:
-                S_alt_list.append(S_alt[:, 50 * overlapping_time:])
+                feat_rate = S_alt.size(1) / (chunk.size(-1) / 16000.0)
+                overlap_frames = int(round(overlapping_time * feat_rate))
+                S_alt_list.append(S_alt[:, overlap_frames:])
             buffer = chunk[:, -16000 * overlapping_time:]
             traversed_time += 30 * 16000 if traversed_time == 0 else chunk.size(-1) - 16000 * overlapping_time
         S_alt = torch.cat(S_alt_list, dim=1)
@@ -288,12 +291,13 @@ def voice_conversion(source, target, diffusion_steps, length_adjust, inference_c
         chunk_cond = cond[:, processed_frames:processed_frames + max_source_window]
         is_last_chunk = processed_frames + max_source_window >= cond.size(1)
         cat_condition = torch.cat([prompt_condition, chunk_cond], dim=1)
-        with torch.autocast(device_type=device.type, dtype=torch.float16 if fp16 else torch.float32):
+        with torch.autocast(device_type=device.type, dtype=torch.float32):
             # Voice Conversion
             vc_target = inference_module.cfm.inference(cat_condition,
-                                                       torch.LongTensor([cat_condition.size(1)]).to(mel2.device),
-                                                       mel2, style2, None, diffusion_steps,
-                                                       inference_cfg_rate=inference_cfg_rate)
+                                                        torch.LongTensor([cat_condition.size(1)]).to(mel2.device),
+                                                        mel2, style2, None, diffusion_steps,
+                                                        inference_cfg_rate=inference_cfg_rate,
+                                                        sway_sampling_coef=sway_sampling_coef)
             vc_target = vc_target[:, :, mel2.size(-1):]
         vc_wave = vocoder_fn(vc_target.float())[0]
         if vc_wave.ndim == 1:
@@ -361,10 +365,11 @@ def main(args):
         gr.Slider(minimum=1, maximum=200, value=10, step=1, label="Diffusion Steps / 扩散步数", info="10 by default, 50~100 for best quality / 默认为 10，50~100 为最佳质量"),
         gr.Slider(minimum=0.5, maximum=2.0, step=0.1, value=1.0, label="Length Adjust / 长度调整", info="<1.0 for speed-up speech, >1.0 for slow-down speech / <1.0 加速语速，>1.0 减慢语速"),
         gr.Slider(minimum=0.0, maximum=1.0, step=0.1, value=0.7, label="Inference CFG Rate", info="has subtle influence / 有微小影响"),
+        gr.Slider(label='Sway sampling / 时间重映射', minimum=0.0, maximum=1.0, step=0.05, value=0.0, info="0 = prior behavior. ~0.9 sharpens timbre similarity / 0=原始行为，约0.9增强目标音色相似度"),
     ]
 
-    examples = [["examples/source/yae_0.wav", "examples/reference/dingzhen_0.wav", 25, 1.0, 0.7, False, True, 0],
-                ["examples/source/jay_0.wav", "examples/reference/azuma_0.wav", 25, 1.0, 0.7, True, True, 0],
+    examples = [["examples/source/yae_0.wav", "examples/reference/dingzhen_0.wav", 25, 1.0, 0.7, 0.0],
+                ["examples/source/jay_0.wav", "examples/reference/azuma_0.wav", 25, 1.0, 0.7, 0.0],
                 ]
 
     outputs = [gr.Audio(label="Stream Output Audio / 流式输出", streaming=True, format='mp3'),

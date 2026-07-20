@@ -301,7 +301,9 @@ def main(args):
             if traversed_time == 0:
                 S_alt_list.append(S_alt)
             else:
-                S_alt_list.append(S_alt[:, 50 * overlapping_time:])
+                feat_rate = S_alt.size(1) / (chunk.size(-1) / 16000.0)
+                overlap_frames = int(round(overlapping_time * feat_rate))
+                S_alt_list.append(S_alt[:, overlap_frames:])
             buffer = chunk[:, -16000 * overlapping_time:]
             traversed_time += 30 * 16000 if traversed_time == 0 else chunk.size(-1) - 16000 * overlapping_time
         S_alt = torch.cat(S_alt_list, dim=1)

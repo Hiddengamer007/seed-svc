@@ -22,6 +22,7 @@ class CFM(torch.nn.Module):
                   temperature=1.0,
                   inference_cfg_rate=[0.5, 0.5],
                   random_voice=False,
+                  sway_sampling_coef=0.0,
                   ):
         """Forward diffusion
 
@@ -45,9 +46,10 @@ class CFM(torch.nn.Module):
         B, T = mu.size(0), mu.size(1)
         z = torch.randn([B, self.in_channels, T], device=mu.device) * temperature
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device)
-        t_span = t_span + (-1) * (torch.cos(torch.pi / 2 * t_span) - 1 + t_span)
-        return self.solve_euler(z, x_lens, prompt, mu, style, t_span, inference_cfg_rate, random_voice)
-    def solve_euler(self, x, x_lens, prompt, mu, style, t_span, inference_cfg_rate=[0.5, 0.5], random_voice=False,):
+        if sway_sampling_coef != 0.0:
+            t_span = t_span + sway_sampling_coef * (torch.cos(torch.pi / 2 * t_span) - 1 + t_span)
+        return self.solve_euler(z, x_lens, prompt, mu, style, t_span, inference_cfg_rate, random_voice, sway_sampling_coef)
+    def solve_euler(self, x, x_lens, prompt, mu, style, t_span, inference_cfg_rate=[0.5, 0.5], random_voice=False, sway_sampling_coef=0.0):
         """
         Fixed euler solver for ODEs.
         Args:

@@ -483,7 +483,9 @@ class VoiceConversionWrapper(torch.nn.Module):
                 if traversed_time == 0:
                     features_list.append(chunk_content_indices)
                 else:
-                    features_list.append(chunk_content_indices[:, 50 * overlapping_time:])
+                    feat_rate = chunk_content_indices.size(1) / (chunk.size(-1) / 16000.0)
+                    overlap_frames = int(round(overlapping_time * feat_rate))
+                    features_list.append(chunk_content_indices[:, overlap_frames:])
                 buffer = chunk[:, -16000 * overlapping_time:]
                 traversed_time += 30 * 16000 if traversed_time == 0 else chunk.size(-1) - 16000 * overlapping_time
             content_indices = torch.cat(features_list, dim=1)

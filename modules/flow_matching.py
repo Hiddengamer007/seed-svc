@@ -28,7 +28,7 @@ class BASECFM(torch.nn.Module, ABC):
             self.zero_prompt_speech_token = False
 
     @torch.inference_mode()
-    def inference(self, mu, x_lens, prompt, style, f0, n_timesteps, temperature=1.0, inference_cfg_rate=0.5):
+    def inference(self, mu, x_lens, prompt, style, f0, n_timesteps, temperature=1.0, inference_cfg_rate=0.5, sway_sampling_coef=0.0, ode_method="euler"):
         """Forward diffusion
 
         Args:
@@ -49,10 +49,11 @@ class BASECFM(torch.nn.Module, ABC):
         B, T = mu.size(0), mu.size(1)
         z = torch.randn([B, self.in_channels, T], device=mu.device) * temperature
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device)
-        # t_span = t_span + (-1) * (torch.cos(torch.pi / 2 * t_span) - 1 + t_span)
-        return self.solve_euler(z, x_lens, prompt, mu, style, f0, t_span, inference_cfg_rate)
+        if sway_sampling_coef != 0.0:
+            t_span = t_span + sway_sampling_coef * (torch.cos(torch.pi / 2 * t_span) - 1 + t_span)
+        return self.solve_euler(z, x_lens, prompt, mu, style, f0, t_span, inference_cfg_rate, ode_method)
 
-    def solve_euler(self, x, x_lens, prompt, mu, style, f0, t_span, inference_cfg_rate=0.5):
+    def solve_euler(self, x, x_lens, prompt, mu, style, f0, t_span, inference_cfg_rate=0.5, ode_method="euler"):
         """
         Fixed euler solver for ODEs.
         Args:
@@ -79,28 +80,36 @@ class BASECFM(torch.nn.Module, ABC):
         x[..., :prompt_len] = 0
         if self.zero_prompt_speech_token:
             mu[..., :prompt_len] = 0
-        for step in tqdm(range(1, len(t_span))):
-            dt = t_span[step] - t_span[step - 1]
+
+        def eval_dphi_dt(x_in, t_in):
             if inference_cfg_rate > 0:
-                # Stack original and CFG (null) inputs for batched processing
                 stacked_prompt_x = torch.cat([prompt_x, torch.zeros_like(prompt_x)], dim=0)
                 stacked_style = torch.cat([style, torch.zeros_like(style)], dim=0)
                 stacked_mu = torch.cat([mu, torch.zeros_like(mu)], dim=0)
-                stacked_x = torch.cat([x, x], dim=0)
-                stacked_t = torch.cat([t.unsqueeze(0), t.unsqueeze(0)], dim=0)
+                stacked_x = torch.cat([x_in, x_in], dim=0)
+                stacked_t = torch.cat([t_in.unsqueeze(0), t_in.unsqueeze(0)], dim=0)
 
-                # Perform a single forward pass for both original and CFG inputs
                 stacked_dphi_dt = self.estimator(
                     stacked_x, stacked_prompt_x, x_lens, stacked_t, stacked_style, stacked_mu,
                 )
 
-                # Split the output back into the original and CFG components
                 dphi_dt, cfg_dphi_dt = stacked_dphi_dt.chunk(2, dim=0)
 
-                # Apply CFG formula
                 dphi_dt = (1.0 + inference_cfg_rate) * dphi_dt - inference_cfg_rate * cfg_dphi_dt
             else:
-                dphi_dt = self.estimator(x, prompt_x, x_lens, t.unsqueeze(0), style, mu)
+                dphi_dt = self.estimator(x_in, prompt_x, x_lens, t_in.unsqueeze(0), style, mu)
+            return dphi_dt
+
+        for step in tqdm(range(1, len(t_span))):
+            dt = t_span[step] - t_span[step - 1]
+            if ode_method == "midpoint":
+                k1 = eval_dphi_dt(x, t)
+                x_mid = x + 0.5 * dt * k1
+                x_mid[:, :, :prompt_len] = 0
+                k2 = eval_dphi_dt(x_mid, t + 0.5 * dt)
+                dphi_dt = k2
+            else:
+                dphi_dt = eval_dphi_dt(x, t)
 
             x = x + dt * dphi_dt
             t = t + dt

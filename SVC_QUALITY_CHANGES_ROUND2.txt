@@ -1,0 +1,210 @@
+Seed-VC — SVC WebUI Quality Improvements (Round 2)
+==================================================
+
+Date:    2026-07-20
+Scope:   No-retraining quality upgrades to the SVC WebUI only.
+Files:   app_svc.py  (the SVC WebUI)
+         modules/flow_matching.py  (CFM/ODE sampler used by the SVC model)
+         requirements.txt  (+pyloudnorm)
+
+Goal:    Make singing voice conversion sound more realistic and cleaner
+         WITHOUT retraining or replacing the released pretrained checkpoint.
+         Every change is either opt-in or preserves prior default behavior
+         where it matters for compatibility.
+
+Method:  Each change was implemented by a dedicated sub-agent and then
+         independently verified by a separate reviewer sub-agent. Bugs found
+         during review were fixed before the change was accepted (see the
+         "Bugs found & fixed in review" section at the end).
+
+
+------------------------------------------------------------------
+1. Higher-order (RK2 / midpoint) ODE solver for flow matching
+------------------------------------------------------------------
+WHAT:
+  Added an optional 2nd-order midpoint (RK2) integrator to the conditional
+  flow-matching sampler, alongside the existing forward-Euler solver.
+    Euler (old):    x = x + dt * f(x, t)
+    Midpoint (new): k1 = f(x, t)
+                    k2 = f(x + 0.5*dt*k1, t + 0.5*dt)
+                    x  = x + dt * k2
+  Classifier-free guidance (CFG) is applied to BOTH estimator evaluations,
+  and the prompt region is re-zeroed on the intermediate midpoint state so it
+  stays consistent with how the main state is masked.
+
+WHERE:
+  modules/flow_matching.py — inference() and solve_euler() gained an
+    ode_method="euler" parameter (default).
+  app_svc.py — voice_conversion() gained use_rk2=False (last param); the
+    cfm.inference() call passes ode_method="midpoint" if use_rk2 else "euler";
+    a UI checkbox "High-quality RK2 sampler / 高精度采样" (default OFF) was added.
+
+WHY:
+  Plain fixed-step Euler needs many diffusion steps to converge, so at low
+  step counts the mel-spectrogram (and thus the audio) is under-resolved.
+  A 2nd-order solver produces cleaner output at the same step count, or lets
+  you reach the same quality with fewer steps. Cost is ~2x model evals per
+  step, so it is opt-in.
+
+COMPATIBILITY:
+  ode_method defaults to "euler", and that path is byte-for-byte identical to
+  the previous code (verified by reviewer). app_vc.py and any other caller
+  keep the euler default and are unaffected.
+
+
+------------------------------------------------------------------
+2. Log-linear, voiced-only F0 upsampling
+------------------------------------------------------------------
+WHAT:
+  Replaced the F0 upsampling from mode='nearest' with LINEAR interpolation of
+  log-F0, applied to voiced frames only. Unvoiced gaps are neutrally filled
+  before interpolation, and a separately-interpolated voiced mask (gated at
+  >= 0.5) restores 0 in unvoiced regions afterward.
+
+WHERE:
+  app_svc.py — the block that upsamples shifted_f0_alt to the cond/mel frame
+  rate (produces interpolated_shifted_f0_alt).
+
+WHY:
+  'nearest' upsampling produces a staircase pitch contour when F0 is stretched
+  to the higher mel frame rate, which is audible as a slightly robotic / stepped
+  pitch. Linear interpolation in the log (musical/pitch) domain gives a smooth,
+  natural contour. Doing it voiced-only (and re-masking unvoiced to 0) prevents
+  pitch from being smeared into silence or unvoiced consonants, which would
+  otherwise create unnatural glides.
+
+COMPATIBILITY:
+  Output keeps shape (1, cond_len) with the same device/dtype, so the
+  downstream cfm.inference call is unaffected.
+
+
+------------------------------------------------------------------
+3. Voiced F0 range clamp (50-1100 Hz)
+------------------------------------------------------------------
+WHAT:
+  Immediately after the F0 tensors are built, voiced frames (>1 Hz) of BOTH
+  the source (F0_alt) and reference (F0_ori) are clamped to [50, 1100] Hz.
+  Unvoiced 0-frames are left untouched.
+
+WHERE:
+  app_svc.py — right after F0_alt / F0_ori are converted to tensors, BEFORE
+  the median-shift and smoothing steps.
+
+WHY:
+  RMVPE occasionally emits octave errors or spurious extreme values on breathy
+  or belted singing. If those bad frames survive into the median-level shift or
+  the smoothing filter, they poison the whole pitch contour. Clamping to a sane
+  human-singing band first prevents a single bad frame from corrupting the
+  median or dragging the contour. It is placed BEFORE shifted_f0_alt is built
+  so it actually affects the pitch used for conditioning.
+
+
+------------------------------------------------------------------
+4. Segment-averaged speaker (CAMPPlus) embedding
+------------------------------------------------------------------
+WHAT:
+  The timbre/style embedding is now the mean of CAMPPlus embeddings computed
+  over overlapping windows of the reference (5s window, 3s hop, ~40% overlap),
+  instead of a single pass over the whole clip. References shorter than 5s fall
+  back to the exact original single-pass behavior.
+
+WHERE:
+  app_svc.py — the style2 computation.
+
+WHY:
+  A single-pass embedding is sensitive to whatever happens to be in that one
+  clip (a loud note, a breath, background variation), giving a noisy timbre
+  estimate. Averaging embeddings over several windows reduces that variance and
+  yields a more stable, representative speaker embedding, which improves how
+  closely the output matches the target timbre. This is a standard
+  speaker-verification trick (segment-and-average).
+
+COMPATIBILITY:
+  Final style2 shape is (1, 192) in every branch (single-pass, averaged, and
+  the zero-window fallback), same device/dtype as before.
+
+
+------------------------------------------------------------------
+5. EBU R128 (LUFS) loudness normalization
+------------------------------------------------------------------
+WHAT:
+  Added a loudness_normalize() helper that measures integrated loudness with
+  pyloudnorm and normalizes the final delivered WAV to -23 LUFS, then applies a
+  safety peak limit so |sample| <= 0.99. It replaces the old
+  "peak-normalize to 0.95" on both final-WAV return paths. The streaming MP3
+  preview path is unchanged.
+
+WHERE:
+  app_svc.py — new loudness_normalize() helper; both is_last_chunk return
+  paths now call it. requirements.txt — added pyloudnorm.
+
+WHY:
+  Peak normalization makes the loudest sample hit a fixed level, but perceived
+  loudness still varies a lot between conversions (a track with one loud
+  transient ends up quiet overall). Normalizing to a target integrated loudness
+  (LUFS) gives consistent perceived volume across outputs, which sounds more
+  professional. pyloudnorm is imported lazily and wrapped in try/except: if it
+  is missing or measurement fails, it falls back to a peak limit and never
+  crashes.
+
+
+------------------------------------------------------------------
+6. Default diffusion steps raised 10 -> 30
+------------------------------------------------------------------
+WHAT:
+  The SVC WebUI "Diffusion Steps" slider default changed from 10 to 30 (and its
+  info text updated). Example step counts were left as-is.
+
+WHERE:
+  app_svc.py — main() Gradio UI slider.
+
+WHY:
+  Singing has more pitch and dynamic detail than speech and benefits from more
+  sampling steps. The old default of 10 was tuned for speed on speech; 30 is a
+  better quality/speed default for singing while still being reasonably fast.
+
+
+------------------------------------------------------------------
+Bugs found & fixed in review (before acceptance)
+------------------------------------------------------------------
+During the reviewer-sub-agent passes, the following real defects in the first
+implementation drafts were caught and fixed:
+
+  - app_svc.py: `if (voiced_idx.numel() > 1).item():` would crash at runtime
+    (a Python bool has no .item() method). Fixed to `if voiced_idx.numel() > 1:`.
+
+  - app_svc.py: a duplicate `torch.from_numpy(F0_...)` re-conversion block ran
+    on tensors that were already converted, which would raise a TypeError.
+    Removed.
+
+  - app_svc.py: the F0 clamp was originally placed AFTER shifted_f0_alt had
+    already been computed, making it inert for the source pitch used
+    downstream. Moved to immediately after tensor construction.
+
+  - app_svc.py: stale slider info text ("10 by default") corrected to match the
+    new default of 30.
+
+
+------------------------------------------------------------------
+Verification
+------------------------------------------------------------------
+  - app_svc.py and modules/flow_matching.py pass Python AST syntax checks.
+  - The euler ODE path is confirmed unchanged (reviewer); app_vc.py unaffected.
+  - Gradio inputs list length (9) matches every examples row length (9).
+  - The cfm.inference call passes both sway_sampling_coef and ode_method;
+    style2 remains shape (1, 192).
+  - No leftover peak-normalize ("* 0.95") remains in app_svc.py.
+
+Note: install the new dependency before launching the SVC WebUI:
+  pip install pyloudnorm
+
+
+------------------------------------------------------------------
+Impact ranking (high -> low)
+------------------------------------------------------------------
+  1. Log-linear F0 upsampling      - removes pitch stair-stepping
+  2. RK2 sampler (opt-in)          - cleaner mel at low step counts
+  3. F0 range clamp                - eliminates octave-error artifacts
+  4. Segment-averaged speaker emb. - steadier / closer target timbre
+  5. LUFS normalization            - consistent perceived loudness
+  6. Default steps 10 -> 30        - better default quality/UX

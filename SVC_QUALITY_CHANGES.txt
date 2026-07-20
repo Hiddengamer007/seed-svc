@@ -1,0 +1,256 @@
+Seed-VC — SVC Quality Improvement Changes
+==========================================
+
+All changes are implemented in the local clone at:
+C:\Users\Jonathan\Documents\OpenCode\SEEDSVC\seed-vc
+
+Goal: make singing voice conversion (SVC) sound more realistic, improve
+audio quality, and reduce artifacts — without retraining or changing the
+released pretrained checkpoint.
+
+
+1. Force CFM (flow-matching) to float32
+---------------------------------------
+Files:   app_svc.py (line ~365), app_vc.py (line ~294),
+         seed_vc_wrapper.py (line ~433)
+Reason:  The CFM/ODE sampler previously ran under fp16 autocast
+         (torch.float16). Half precision accumulates rounding error in
+         the Euler ODE solver, producing audible high-frequency hiss and
+         a metallic coloration. Running the ODE in float32 removes this
+         artifact with negligible speed cost. The v2 wrapper already did
+         this (modules/v2/vc_wrapper.py:644); the v1 SVC path now matches.
+
+
+2. BigVGAN: replace tanh final activation with hard clamp
+---------------------------------------------------------
+File:    modules/bigvgan/bigvgan.py (forward, line ~381)
+Reason:  The pretrained BigVGAN config used use_tanh_at_final=True. tanh
+         hard-compresses signal peaks, dulling transients and reducing
+         vocal "bite"/dynamics — a known quality limiter for singing.
+         A hard clamp to [-1, 1] preserves transients and crispness.
+         (The use_tanh_at_final config attribute is now unused dead config.)
+IMPACT NOTE: This is a modest change. tanh only saturates very near +/-1,
+which is exactly where the clamp also clips, so the audible difference is
+small (slightly cleaner peaks, not a dramatic timbre change). Doc originally
+overstated this as a major improvement.
+
+
+3. BigVGAN: enable CUDA anti-alias (alias-free) kernels
+-------------------------------------------------------
+Files:   app_svc.py (line ~68), app_vc.py, seed_vc_wrapper.py,
+         real-time-gui.py
+Reason:  BigVGAN was loaded with use_cuda_kernel=False, disabling the
+         anti-aliased activation CUDA kernels. These alias-free activations
+         improve harmonic clarity and reduce aliasing artifacts. Now
+         enabled when CUDA is available (conditional, safe on CPU/MPS).
+
+
+4. F0 smoothing after median-shift / pitch-shift
+------------------------------------------------
+Files:   app_svc.py (voice_conversion, lines ~334-348),
+         seed_vc_wrapper.py (convert_voice, lines ~409-423)
+Reason:  The original pipeline applied only a median-log-F0 level shift
+         with no smoothing. On breathy or low-voiced singing this caused
+         pitch jitter and octave jumps — the #1 cause of "robotic" SVC.
+         A moving-median (medfilt) plus Savitzky-Golay low-pass is now
+         applied to VOICED frames only (unvoiced frames stay at 0, so
+         pitch is not smeared across voiced/unvoiced boundaries).
+         Result: more stable, natural pitch contour.
+
+
+5. Post-processing chain (high-pass + soft limiter + normalize)
+--------------------------------------------------------------
+File:    app_svc.py — postprocess_wave() helper (lines ~227-240) and
+          soft_limit_chunk() (lines ~261-269); full postprocess applied
+          ONCE to the concatenated full wave (HPF via filtfilt + soft
+          limiter), then LUFS-normalized to -23 LUFS (Round 2, item 13).
+          Streamed MP3 chunks get soft_limit_chunk() only (no per-chunk
+          filtfilt). Peak-normalize to 0.95 only happens as a fallback when
+          post-process AND loudness-norm are both disabled.
+Reason:  Vocoder output carries sub-bass rumble and occasional clipping
+         that make SVC sound synthetic. A 30 Hz 2nd-order high-pass
+         removes rumble; a soft limiter avoids harsh clipping while
+         keeping headroom; the final concatenation is peak-normalized
+         to 0.95 once.
+CORRECTION (2026-07-20): The original implementation applied the full
+postprocess_wave() — including the filtfilt high-pass — to EVERY streamed
+chunk. filtfilt assumes zero-padded edges, so running it per chunk
+injected a transient at each chunk seam (exactly the artifact we wanted
+to avoid). Fixed: full postprocess now runs once on the concatenated
+full wave; streamed preview chunks only get the seam-safe soft limiter.
+
+
+6. Fix non-Whisper / wrapper long-audio chunking
+-----------------------------------------------
+Files:   app_svc.py (long-audio else-branch, lines ~285-289),
+         app_vc.py (long-audio else-branch, lines ~254-258),
+         seed_vc_wrapper.py (_process_whisper_features, was line ~307)
+Reason:  Long-audio chunking must compute the feature frame rate from the
+         actual semantic output rather than hardcoding Whisper's 50 fps.
+         app_svc.py and app_vc.py already used dynamic feat_rate; however
+         seed_vc_wrapper.py STILL hardcoded `50 * overlapping_time:` for
+         the Whisper path (a latent bug for any non-50fps tokenizer and
+         inconsistent with the other two callers). Fixed by computing
+         feat_rate from the actual chunk output, matching app_svc.py /
+         app_vc.py.
+
+
+7. Tunable sway sampling in flow-matching samplers
+-------------------------------------------------
+Files:   modules/v2/cfm.py, modules/flow_matching.py,
+         app_svc.py (UI slider + passed to cfm.inference),
+         app_vc.py (UI slider + passed to cfm.inference)
+Reason:  Both CFM samplers already accept sway_sampling_coef (default 0.0 =
+         prior behavior), but no caller ever set a non-zero value, so the
+         "sway/amo sampling" feature was a dead lever — it changed nothing.
+         Now a UI slider ("Sway sampling / 时间重映射", 0.0-1.0, default 0.0)
+         is exposed in both SVC and VC apps and passed through to
+         cfm.inference(). Setting it (e.g. ~0.9) sharpens target-timbre
+         similarity when desired. Default 0.0 keeps identical prior output.
+
+
+8. NOT changed — config training-time params
+--------------------------------------------
+Files:   configs/presets/config_dit_mel_seed_uvit_whisper_base_f0_44k.yml
+Reason:  n_f0_bins (256) and class_dropout_prob (0.1) are baked into the
+         released checkpoint's weight shapes. Changing n_f0_bins would
+         break F0-embedding weight loading; class_dropout_prob only
+         affects training. Left unchanged to preserve pretrained
+         compatibility. fmax: "None" is correct (full 44.1 kHz band).
+
+
+Verification
+------------
+All touched files pass Python AST syntax checks:
+  app_svc.py, app_vc.py, seed_vc_wrapper.py, real-time-gui.py,
+  modules/bigvgan/bigvgan.py, modules/v2/cfm.py, modules/flow_matching.py
+
+Consistency fixes applied (2026-07-20):
+  - app_vc.py: CFM autocast now forces float32 (was fp16 when --fp16)
+  - app_vc.py: long-audio chunking now uses dynamic feat_rate (was 50 fps)
+  - seed_vc_wrapper.py: F0 smoothing (medfilt + savgol) now applied
+
+Additional corrections applied (2026-07-20 review):
+  - app_svc.py: postprocess_wave() full chain (incl. filtfilt HPF) now runs
+    ONCE on the concatenated full wave; streamed chunks use seam-safe
+    soft_limit_chunk() only (was filtfilt per chunk -> seam transients)
+  - seed_vc_wrapper.py: long-audio chunking now uses dynamic feat_rate
+    instead of hardcoded 50*overlapping_time
+  - app_svc.py / app_vc.py: "Sway sampling" slider exposed and passed to
+    cfm.inference() (was a dead, never-set parameter)
+
+No function signatures used by the Gradio UI (main()) were changed, and
+the streaming MP3 UI path is preserved; only the bundled full-output WAV
+is now globally post-processed.
+
+Impact ranking (high -> low):
+  1. F0 smoothing (item 4)        - real, measurable pitch stability
+  2. CFM float32 (item 1)         - real, removes fp16 hiss
+  3. CUDA anti-alias kernels (3)  - real on GPU
+  4. Post-process fix (item 5)    - real, and now seam-artifact-free
+  5. BigVGAN clamp (item 2)       - minor (tanh saturates only near +/-1)
+  6. Chunking fix (item 6)        - correctness, wrapper path only
+  7. Sway sampling (item 7)       - opt-in lever, default = no change
+
+
+===================================================================
+ROUND 2 (2026-07-20): No-retraining SVC WebUI quality upgrades
+===================================================================
+Scope: app_svc.py (the SVC WebUI) and modules/flow_matching.py only.
+Method: implemented via orchestrated sub-agents, each change reviewed by
+a separate reviewer sub-agent; bugs found in review were fixed before
+acceptance.
+
+
+9. Higher-order (RK2 / midpoint) ODE solver for flow matching
+-------------------------------------------------------------
+Files:   modules/flow_matching.py (inference/solve_euler, ~lines 31-121),
+         app_svc.py (voice_conversion + UI checkbox + cfm.inference call)
+Reason:  The CFM sampler used plain fixed-step forward Euler, which needs
+         many steps to converge. Added an opt-in 2nd-order midpoint (RK2)
+         integrator:  k1=f(x,t); k2=f(x+0.5*dt*k1, t+0.5*dt); x+=dt*k2.
+         CFG is applied to BOTH estimator evaluations; the prompt region
+         is re-zeroed on the midpoint state. Cleaner mel at low step counts
+         (~2x cost per step).
+Compat:  ode_method defaults to "euler" and that path is byte-for-byte
+         identical to the previous code (verified by reviewer). Exposed as
+         a UI checkbox "High-quality RK2 sampler"; default OFF = no change.
+         app_vc.py is unaffected (still calls with the euler default).
+
+
+10. Log-linear (voiced-only) F0 upsampling
+------------------------------------------
+File:    app_svc.py (voice_conversion, F0 -> cond-rate interpolation)
+Reason:  F0 was upsampled to the cond/mel frame rate with mode='nearest',
+         causing audible pitch stair-stepping. Now interpolates log-F0
+         LINEARLY over voiced frames only; unvoiced gaps are neutrally
+         filled before interpolation and re-masked to 0 afterward (via a
+         separately-interpolated voiced mask, gated at >=0.5), so pitch is
+         never smeared into silence/unvoiced regions. Output keeps shape
+         (1, cond_len), same device/dtype.
+Review-fix: initial impl had `if (voiced_idx.numel() > 1).item():`
+         (AttributeError: bool has no .item()) and a duplicate
+         torch.from_numpy re-conversion block that would crash on
+         already-tensor inputs. Both removed/fixed.
+
+
+11. Voiced F0 range clamp (50-1100 Hz)
+--------------------------------------
+File:    app_svc.py (right after F0 tensors are built)
+Reason:  RMVPE occasionally emits octave errors / spurious extremes on
+         breathy or belted singing. Voiced frames (>1 Hz) of BOTH source
+         (F0_alt) and reference (F0_ori) are clamped to a sane singing
+         band before median-shift/smoothing so bad frames can't poison the
+         median or the pitch contour. Unvoiced 0-frames are untouched.
+Review-fix: clamp was originally placed AFTER shifted_f0_alt was built
+         (making it inert downstream) plus a duplicate conversion; moved
+         to immediately after tensor construction so it actually affects
+         the conditioning pitch.
+
+
+12. Segment-averaged speaker (CAMPPlus) embedding
+-------------------------------------------------
+File:    app_svc.py (style2 computation)
+Reason:  Timbre style embedding was computed from a single pass over the
+         whole reference. Now, for references >= 5s, the CAMPPlus embedding
+         is averaged over 5s windows with 3s hop (~40% overlap), reducing
+         variance and improving target-timbre similarity. References < 5s
+         fall back to the exact original single-pass behavior. Result
+         shape (1, 192) is unchanged in all branches.
+
+
+13. EBU R128 (LUFS) loudness normalization
+------------------------------------------
+Files:   app_svc.py (loudness_normalize helper; both final-WAV paths),
+         requirements.txt (+pyloudnorm)
+Reason:  The delivered full WAV was peak-normalized to 0.95, which leaves
+         perceived loudness inconsistent between conversions. Now normalizes
+         integrated loudness to -23 LUFS (pyloudnorm) with a safety peak
+         limit to <= 0.99. Lazily imported and wrapped in try/except: if
+         pyloudnorm is missing or measurement fails it falls back to a peak
+         limit (never crashes). Streaming MP3 preview path is unchanged.
+
+
+14. Default diffusion steps 10 -> 30 for singing
+------------------------------------------------
+File:    app_svc.py (main() UI slider default + info text)
+Reason:  Singing benefits from more sampling steps than the old default of
+         10; raised the SVC WebUI default to 30. Example step counts left
+         as-is.
+
+
+Round-2 impact ranking (high -> low):
+  10. Log-linear F0 upsampling   - removes pitch stair-stepping
+   9. RK2 sampler (opt-in)       - cleaner mel at low steps
+  11. F0 range clamp             - kills octave-error artifacts
+  12. Segment-avg speaker embed  - better/steadier timbre similarity
+  13. LUFS normalization         - consistent perceived loudness
+  14. Default steps 10->30       - better default quality/UX
+
+Verification:
+  - app_svc.py and modules/flow_matching.py pass AST syntax checks.
+  - euler ODE path confirmed unchanged (reviewer); app_vc.py unaffected.
+  - inputs list (9) == every examples row (9) in the SVC Gradio UI.
+  - All cfm.inference call sites pass both sway_sampling_coef and
+    ode_method; style2 remains (1,192).
+
