@@ -552,7 +552,8 @@ def main(args):
                    "for details and updates.<br>Note that any reference audio will be forcefully clipped to 25s if beyond this length.<br> "
                    "If total duration of source and reference audio exceeds 30s, source audio will be processed in chunks.<br> "
                    "无需训练的 zero-shot 语音/歌声转换模型，若需本地部署查看[GitHub页面](https://github.com/Plachtaa/seed-vc)<br>"
-                   "请注意，参考音频若超过 25 秒，则会被自动裁剪至此长度。<br>若源音频和参考音频的总时长超过 30 秒，源音频将被分段处理。")
+                   "请注意，参考音频若超过 25 秒，则会被自动裁剪至此长度。<br>若源音频和参考音频的总时长超过 30 秒，源音频将被分段处理。"
+                   "<br><br>### Quality Enhancements / 质量增强")
     inputs = [
         gr.Audio(type="filepath", label="Source Audio / 源音频"),
         gr.Audio(type="filepath", label="Reference Audio / 参考音频"),
@@ -570,7 +571,6 @@ def main(args):
         gr.Checkbox(label="Segment-averaged embedding / 分段平均嵌入", value=True, info="Average speaker embedding over overlapping 5s windows"),
         gr.Checkbox(label="Post-process / 后处理", value=True, info="30 Hz high-pass + soft limiter on full output wave"),
         gr.Checkbox(label="LUFS normalization / 响度归一化", value=True, info="Normalize perceived loudness to -23 LUFS"),
-        gr.Markdown("### Quality Enhancements / 质量增强"),
     ]
 
     examples = [["examples/source/yae_0.wav", "examples/reference/dingzhen_0.wav", 25, 1.0, 0.7, True, 0, 0.0, False, True, True, True, True, True, True],
